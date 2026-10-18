@@ -15,6 +15,7 @@ export interface Env {
   GUILD_ID: string;
   CHANNEL_ID: string;
   ISSUE_URL?: string;
+  ADMIN_KEY?: string;
   GATEWAY: DurableObjectNamespace<Gateway>;
 }
 interface Hello {
@@ -63,6 +64,22 @@ export class Gateway extends DurableObject<Env> {
   private ws: WebSocket | null = null;
   private seq: number | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
+  private recent: string[] = [];
+  private inflight = new Set<string>();
+
+  private trace(line: string): void {
+    this.recent.push(`${new Date().toISOString()} ${line}`);
+    if (this.recent.length > 200) this.recent.shift();
+  }
+
+  // Live introspection: wrangler tail does not surface this DO's logs.
+  async debug(): Promise<unknown> {
+    return {
+      connected: !!this.ws && this.ws.readyState === WebSocket.OPEN,
+      seq: this.seq,
+      recent: this.recent,
+    };
+  }
 
   // Called from the Worker on each cron tick, and on demand. Reconnects if the
   // socket dropped, otherwise a no-op.
@@ -78,6 +95,7 @@ export class Gateway extends DurableObject<Env> {
     ws.addEventListener("message", (event) => this.onMessage(String(event.data)));
     ws.addEventListener("close", (event) => {
       console.log(`gateway closed: code=${event.code} reason=${event.reason}`);
+      this.trace(`closed code=${event.code} reason=${event.reason}`);
       this.reset();
     });
     ws.addEventListener("error", () => {
@@ -99,7 +117,14 @@ export class Gateway extends DurableObject<Env> {
   private reset(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    this.ws = null;
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // already closed
+      }
+      this.ws = null;
+    }
   }
 
   private send(payload: unknown): void {
@@ -131,47 +156,93 @@ export class Gateway extends DurableObject<Env> {
   private async onDispatch(type: string, data: unknown): Promise<void> {
     if (type === "READY") {
       const { user } = data as { user?: { username?: string; id?: string } };
-      console.log(`gateway ready as ${user?.username} (${user?.id})`);
+      this.trace(`READY as ${user?.username}`);
       return;
     }
     // GUILD_CREATE carries the initial presence snapshot; PRESENCE_UPDATE is
-    // each later change. Both feed the same handler.
+    // each later change. Trace both; only act on the watched guild.
     if (type === "GUILD_CREATE") {
-      const { presences } = data as { presences?: PresenceUpdate[] };
-      for (const presence of presences ?? []) await this.handlePresence(presence, false);
+      const g = data as { id?: string; presences?: PresenceUpdate[] };
+      const watched = g.id === this.env.GUILD_ID;
+      this.trace(`GUILD_CREATE guild=${g.id}${watched ? "" : " (other)"} presences=${g.presences?.length ?? 0}`);
+      for (const presence of g.presences ?? []) {
+        this.tracePresence(watched ? "" : "other ", presence);
+        if (watched) await this.act(presence);
+      }
       return;
     }
     if (type === "PRESENCE_UPDATE") {
-      await this.handlePresence(data as PresenceUpdate, true);
+      const p = data as PresenceUpdate;
+      if (p.guild_id !== this.env.GUILD_ID) return;
+      this.tracePresence("", p);
+      await this.act(p);
     }
   }
 
-  private async handlePresence(p: PresenceUpdate, checkGuild: boolean): Promise<void> {
-    if (checkGuild && p.guild_id !== this.env.GUILD_ID) return;
+  private tracePresence(tag: string, p: PresenceUpdate): void {
+    const names = (p.activities ?? []).map((a) => `${a.type}:${a.name}`).join(",");
+    this.trace(`  ${tag}user=${p.user?.id} act=[${names}]`);
+  }
 
+  private async act(p: PresenceUpdate): Promise<void> {
     const userId = p.user?.id;
     const raw = rawTitleId(p.activities);
     if (!userId || !raw) return;
 
-    const key = `pinged:${userId}`;
-    if (await this.ctx.storage.get(key)) return;
+    // Guard per user *and* title: a person can be told to fix nanoDNS for one
+    // game and still need to report a different unresolved title.
+    const key = `pinged:${userId}:${raw}`;
+    // Claim synchronously before any await. orbisRPC reports a presence in
+    // bursts, and the storage guard alone has await points where a concurrent
+    // burst slips through and posts the same ping twice.
+    if (this.inflight.has(key)) {
+      this.trace(`  inflight ${userId}:${raw}`);
+      return;
+    }
+    this.inflight.add(key);
+    try {
+      if (await this.ctx.storage.get(key)) {
+        this.trace(`  skip guard ${userId}:${raw}`);
+        return;
+      }
 
-    const tmdb = await tmdbResolve(raw);
-    // A lookup failure is not a verdict: leave the guard unset and retry on
-    // the next presence update rather than mislabelling the title.
-    if (tmdb.status === "error") return;
+      const tmdb = await tmdbResolve(raw);
+      // A lookup failure is not a verdict: leave the guard unset and retry on
+      // the next presence update rather than mislabelling the title.
+      if (tmdb.status === "error") {
+        this.trace(`  lookup error for ${raw}`);
+        return;
+      }
 
-    const issueUrl =
-      this.env.ISSUE_URL ?? "https://github.com/SirHumza/orbisRPC/issues/37";
-    const content =
-      tmdb.status === "resolved"
-        ? nanoDnsText(userId, raw, tmdb.name)
-        : unknownGameText(userId, raw, issueUrl);
+      const issueUrl =
+        this.env.ISSUE_URL ?? "https://github.com/SirHumza/orbisRPC/issues/37";
+      const content =
+        tmdb.status === "resolved"
+          ? nanoDnsText(userId, raw, tmdb.name)
+          : unknownGameText(userId, raw, issueUrl);
+      this.trace(`PING user=${userId} id=${raw} -> ${tmdb.status}`);
 
-    await this.ctx.storage.put(key, Date.now());
-    const ok = await this.post(content);
-    // Roll the guard back on failure so a transient error retries next update.
-    if (!ok) await this.ctx.storage.delete(key);
+      await this.ctx.storage.put(key, Date.now());
+      const ok = await this.post(content);
+      // Roll the guard back on failure so a transient error retries next update.
+      if (!ok) await this.ctx.storage.delete(key);
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+
+  // Run the real ping path for a synthetic presence. End-to-end proof without
+  // needing a console to be live.
+  async simulate(userId: string, raw: string): Promise<string> {
+    await this.act({ guild_id: this.env.GUILD_ID, user: { id: userId }, activities: [{ type: 0, name: raw }] });
+    return "ok";
+  }
+
+  // Force a reconnect so a fresh IDENTIFY replays the GUILD_CREATE presence
+  // snapshot. Needed because already-seen presences only re-report on change.
+  async reconnect(): Promise<void> {
+    this.reset();
+    await this.ensureConnected();
   }
 
   private async post(content: string): Promise<boolean> {
