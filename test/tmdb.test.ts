@@ -29,6 +29,13 @@ test("resolves, misses, and errors are distinct", async () => {
   );
   assert.equal(miss.status, "missing");
 
+  // Sony answers an unknown id with 403 AccessDenied.
+  const denied = await tmdbResolve(
+    "CUSA99999",
+    async () => new Response("", { status: 403 }),
+  );
+  assert.equal(denied.status, "missing");
+
   const down = await tmdbResolve("CUSA00740", async () => {
     throw new Error("network down");
   });

@@ -62,7 +62,8 @@ export async function tmdbResolve(
     // rather than tell a retail user their game is homebrew.
     return { status: "error" };
   }
-  if (res.status === 404) return { status: "missing" };
+  // Sony answers an unknown id with 403 AccessDenied (not 404).
+  if (res.status === 403 || res.status === 404) return { status: "missing" };
   if (!res.ok) return { status: "error" };
   const body = (await res.json()) as TmdbBody;
   const name = body?.names?.[0]?.name;
