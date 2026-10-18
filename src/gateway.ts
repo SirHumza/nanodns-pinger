@@ -2,7 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 import { rawTitleId, type Activity } from "./detect";
 import { tmdbResolve } from "./tmdb";
 
-const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+// Workers fetch() cannot load a wss:// URL; fetch the https form with the
+// Upgrade header and read res.webSocket.
+const GATEWAY_URL = "https://gateway.discord.gg/?v=10&encoding=json";
 // GUILDS (1 << 0) | GUILD_PRESENCES (1 << 8). Presence data is gateway-only,
 // there is no REST endpoint for it.
 const INTENTS = (1 << 0) | (1 << 8);
@@ -35,8 +37,7 @@ function nanoDnsText(userId: string, raw: string, name?: string): string {
     `Fix it:\n` +
     `1. Open \`/data/nanodns/nanodns.ini\` and add \`tmdb.np.dl.playstation.net\` at the top of \`[exceptions]\`.\n` +
     `2. Set your PS4's DNS to \`127.0.0.1\` so traffic actually goes through nanoDNS (the step most people miss).\n` +
-    `3. Reboot the console.\n\n` +
-    `Full guide: <https://github.com/SirHumza/orbisRPC#troubleshooting>`
+    `3. Reboot the console.`
   );
 }
 
@@ -75,8 +76,14 @@ export class Gateway extends DurableObject<Env> {
     ws.accept();
     this.ws = ws;
     ws.addEventListener("message", (event) => this.onMessage(String(event.data)));
-    ws.addEventListener("close", () => this.reset());
-    ws.addEventListener("error", () => this.reset());
+    ws.addEventListener("close", (event) => {
+      console.log(`gateway closed: code=${event.code} reason=${event.reason}`);
+      this.reset();
+    });
+    ws.addEventListener("error", () => {
+      console.log("gateway socket error");
+      this.reset();
+    });
 
     // Ask for a presence snapshot so we do not wait for the next update.
     this.send({
@@ -122,6 +129,11 @@ export class Gateway extends DurableObject<Env> {
   }
 
   private async onDispatch(type: string, data: unknown): Promise<void> {
+    if (type === "READY") {
+      const { user } = data as { user?: { username?: string; id?: string } };
+      console.log(`gateway ready as ${user?.username} (${user?.id})`);
+      return;
+    }
     // GUILD_CREATE carries the initial presence snapshot; PRESENCE_UPDATE is
     // each later change. Both feed the same handler.
     if (type === "GUILD_CREATE") {
