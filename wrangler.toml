@@ -1,0 +1,17 @@
+name = "nanodns-pinger"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+[vars]
+GUILD_ID = "1554582789515645051"
+CHANNEL_ID = "1561417461537046620"
+
+[durable_objects]
+bindings = [{ name = "GATEWAY", class_name = "Gateway" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Gateway"]
+
+[triggers]
+crons = ["*/1 * * * *"]
