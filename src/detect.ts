@@ -4,9 +4,10 @@ export interface Activity {
 }
 
 // A Discord Rich Presence whose name is a bare title id means the game-name
-// and cover-art lookup failed. On PS4 that is the DNS/TMDB case (orbisRPC
-// shows CUSA12398 with a "?" tile). Type 0 is "Playing".
-const RAW_TITLE_ID = /^(CUSA|PPSA)\d{5}$/;
+// and cover-art lookup failed. Title ids are 9 uppercase alphanumerics; the
+// prefix is not always CUSA/PPSA (MRCH, PPSA, HARC, homebrew ids, ...), so
+// match the shape, not a prefix list. Type 0 is "Playing".
+const RAW_TITLE_ID = /^[A-Z0-9]{9}$/;
 
 export function rawTitleId(activities: Activity[] | undefined): string | null {
   if (!activities) return null;
