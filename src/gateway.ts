@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { rawTitleId, type Activity } from "./detect";
 import { tmdbResolve } from "./tmdb";
+import { pkgzoneResolve, type PkgzoneHit } from "./pkgzone";
+import { knownResolve } from "./known";
+import { alreadyReported, commentBody, parseIssueUrl, postComment } from "./github";
 
 // Workers fetch() cannot load a wss:// URL; fetch the https form with the
 // Upgrade header and read res.webSocket.
@@ -9,12 +12,18 @@ const GATEWAY_URL = "https://gateway.discord.gg/?v=10&encoding=json";
 // there is no REST endpoint for it.
 const INTENTS = (1 << 0) | (1 << 8);
 const API = "https://discord.com/api/v10";
+const DEFAULT_ISSUE_URL = "https://github.com/SirHumza/orbisRPC/issues/37";
+// Bumped on behaviour changes so ?debug=1 reveals which build a (pinned)
+// Durable Object instance is actually running.
+const BUILD = "known-homebrew-1";
 
 export interface Env {
   DISCORD_TOKEN: string;
   GUILD_ID: string;
   CHANNEL_ID: string;
   ISSUE_URL?: string;
+  /** GitHub token (contents:write on the report issue is all it needs). */
+  GH_TOKEN?: string;
   ADMIN_KEY?: string;
   GATEWAY: DurableObjectNamespace<Gateway>;
 }
@@ -42,19 +51,23 @@ function nanoDnsText(userId: string, raw: string, name?: string): string {
   );
 }
 
-// Sony TMDB does not know the id and neither does orbisRPC's other sources
-// (that is why the raw id is showing at all). It is a title nobody has a name
-// or cover for yet, so it needs posting to the orbisRPC missing-titles thread.
-function unknownGameText(userId: string, raw: string, issueUrl: string): string {
+// Sony TMDB does not know the id and neither does pkg-zone (that is why the
+// raw id is showing at all). The bot has already auto-reported it to the
+// missing-titles thread, so the member has nothing to do.
+function unknownGameText(
+  userId: string,
+  raw: string,
+  issueUrl: string,
+  name: string | null,
+): string {
+  const found = name
+    ? `It is a known homebrew title (**${name}**), and a maintainer already has the name and cover`
+    : `The name and cover have to come from you`;
   return (
     `<@${userId}> your PS4 presence is showing the raw title id \`${raw}\` ` +
-    `with no cover art. orbisRPC could not resolve a name or artwork for this ` +
-    `title anywhere, so it needs to be added.\n\n` +
-    `Post it in the missing-titles thread with:\n` +
-    `- the title id: \`${raw}\`\n` +
-    `- the correct display name\n` +
-    `- a cover art URL (optional, direct https link)\n\n` +
-    `${issueUrl}`
+    `with no cover art. That title is not in Sony's catalogue. ${found}. ` +
+    `I already reported it in the missing-titles thread — no action needed on your end.\n\n` +
+    `Track it here: ${issueUrl}`
   );
 }
 
@@ -75,6 +88,7 @@ export class Gateway extends DurableObject<Env> {
   // Live introspection: wrangler tail does not surface this DO's logs.
   async debug(): Promise<unknown> {
     return {
+      build: BUILD,
       connected: !!this.ws && this.ws.readyState === WebSocket.OPEN,
       seq: this.seq,
       recent: this.recent,
@@ -215,11 +229,23 @@ export class Gateway extends DurableObject<Env> {
       }
 
       const issueUrl =
-        this.env.ISSUE_URL ?? "https://github.com/SirHumza/orbisRPC/issues/37";
+        this.env.ISSUE_URL ?? DEFAULT_ISSUE_URL;
+      let pkg: PkgzoneHit | null = null;
+      if (tmdb.status === "missing") {
+        // Same fallback order orbisRPC uses on-console: pkg-zone for the
+        // homebrew name + cover that Sony's retail-only endpoint lacks, then a
+        // curated override for titles pkg-zone does not carry either.
+        pkg = (await pkgzoneResolve(raw)) ?? knownResolve(raw);
+        this.trace(pkg ? `  pkgzone/known hit: ${pkg.name}` : `  pkgzone miss`);
+        const display = userId
+          ? await this.memberName(userId).catch(() => null)
+          : null;
+        await this.autoSubmit(raw, pkg, userId ?? null, display);
+      }
       const content =
         tmdb.status === "resolved"
           ? nanoDnsText(userId, raw, tmdb.name)
-          : unknownGameText(userId, raw, issueUrl);
+          : unknownGameText(userId, raw, issueUrl, pkg?.name ?? null);
       this.trace(`PING user=${userId} id=${raw} -> ${tmdb.status}`);
 
       await this.ctx.storage.put(key, Date.now());
@@ -231,8 +257,79 @@ export class Gateway extends DurableObject<Env> {
     }
   }
 
-  // Run the real ping path for a synthetic presence. End-to-end proof without
-  // needing a console to be live.
+  // Resolve the sitting member's display name so the GitHub report says who
+  // was playing. Best effort: null on any failure.
+  private async memberName(userId: string): Promise<string | null> {
+    const res = await fetch(`${API}/guilds/${this.env.GUILD_ID}/members/${userId}`, {
+      headers: { authorization: `Bot ${this.env.DISCORD_TOKEN}` },
+    });
+    if (!res.ok) return null;
+    const m = (await res.json()) as {
+      nick?: string | null;
+      user?: { global_name?: string | null; username?: string };
+    };
+    return m.nick ?? m.user?.global_name ?? m.user?.username ?? null;
+  }
+
+  // One comment per title id on the missing-titles issue, deduped both against
+  // DO storage and a scan of the thread (survives storage resets).
+  private async autoSubmit(
+    raw: string,
+    pkg: PkgzoneHit | null,
+    playerId: string | null,
+    player: string | null,
+  ): Promise<void> {
+    const token = this.env.GH_TOKEN;
+    if (!token) {
+      this.trace("  github: no token set, auto-submit skipped");
+      return;
+    }
+    let repo: string;
+    let issueNumber: number;
+    try {
+      const parsed = parseIssueUrl(this.env.ISSUE_URL ?? DEFAULT_ISSUE_URL);
+      repo = parsed.repo;
+      issueNumber = parsed.number;
+    } catch (err) {
+      this.trace(`  github: bad ISSUE_URL: ${(err as Error).message}`);
+      return;
+    }
+    const guard = `github:${raw}`;
+    if (await this.ctx.storage.get(guard)) {
+      this.trace(`  github: skip guard ${raw}`);
+      return;
+    }
+    this.inflight.add(guard);
+    try {
+      if (await alreadyReported(repo, issueNumber, token, raw)) {
+        await this.ctx.storage.put(guard, Date.now());
+        this.trace(`  github: ${raw} already on #${issueNumber}`);
+        return;
+      }
+      await postComment(
+        repo,
+        issueNumber,
+        token,
+        commentBody({
+          titleId: raw,
+          name: pkg?.name ?? null,
+          cover: pkg?.cover ?? null,
+          player: player ? `${player} (discord id ${playerId})` : null,
+          seenAt: new Date().toISOString(),
+          source: pkg
+            ? "Sony TMDB: no entry · name + cover provided above"
+            : "Sony TMDB: no entry · pkg-zone: no entry either",
+        }),
+      );
+      await this.ctx.storage.put(guard, Date.now());
+      this.trace(`  github: reported ${raw} on #${issueNumber}`);
+    } catch (err) {
+      this.trace(`  github failed: ${(err as Error).message}`);
+    } finally {
+      this.inflight.delete(guard);
+    }
+  }
+
   async simulate(userId: string, raw: string): Promise<string> {
     await this.act({ guild_id: this.env.GUILD_ID, user: { id: userId }, activities: [{ type: 0, name: raw }] });
     return "ok";
